@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class MultiHeadAttention(nn.Module):
@@ -78,18 +79,31 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, max_seq_len=1024, dropout=0.1):
+    def __init__(self, d_model, n_heads, d_ff, max_seq_len=1024, dropout=0.1, use_checkpoint=False):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout)
         self.ln2 = nn.LayerNorm(d_model)
         self.ff = FeedForward(d_model, d_ff, dropout)
+        self.use_checkpoint = use_checkpoint
         
     def forward(self, x):
-        # Pre-LayerNorm
-        x = x + self.attn(self.ln1(x))
-        x = x + self.ff(self.ln2(x))
-        return x
+        if self.use_checkpoint and self.training:
+            # Use gradient checkpointing to save memory
+            x = x + checkpoint(self._attn_block, x, use_reentrant=False)
+            x = x + checkpoint(self._ff_block, x, use_reentrant=False)
+            return x
+        else:
+            # Normal forward pass
+            x = x + self.attn(self.ln1(x))
+            x = x + self.ff(self.ln2(x))
+            return x
+    
+    def _attn_block(self, x):
+        return self.attn(self.ln1(x))
+    
+    def _ff_block(self, x):
+        return self.ff(self.ln2(x))
 
 
 class GPT2Model(nn.Module):
@@ -102,7 +116,8 @@ class GPT2Model(nn.Module):
         d_ff=4096,
         max_seq_len=1024,
         dropout=0.1,
-        tie_weights=True
+        tie_weights=True,
+        use_gradient_checkpointing=False
     ):
         super().__init__()
         
@@ -116,8 +131,9 @@ class GPT2Model(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
         # Transformer blocks
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, d_ff, max_seq_len, dropout)
+            TransformerBlock(d_model, n_heads, d_ff, max_seq_len, dropout, use_checkpoint=use_gradient_checkpointing)
             for _ in range(n_layers)
         ])
         
@@ -227,7 +243,7 @@ class GPT2Model(nn.Module):
         return input_ids
 
 
-def get_gpt2_model(model_size="medium", vocab_size=50257):
+def get_gpt2_model(model_size="medium", vocab_size=50257, use_gradient_checkpointing=False):
     """
     Get GPT-2 model with specified size.
     
@@ -271,5 +287,6 @@ def get_gpt2_model(model_size="medium", vocab_size=50257):
         d_model=config["d_model"],
         n_heads=config["n_heads"],
         n_layers=config["n_layers"],
-        d_ff=config["d_ff"]
+        d_ff=config["d_ff"],
+        use_gradient_checkpointing=use_gradient_checkpointing
     )

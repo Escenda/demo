@@ -20,6 +20,7 @@ from phase4_meta_reasoning import Phase4MetaReasoningDatasetGenerator
 
 from tokenizer import JapaneseTokenizer
 from train import train_phase
+from train_optimized import train_phase_optimized
 from model import get_gpt2_model
 
 
@@ -116,16 +117,24 @@ def generate_phase4_data():
     generator.create_training_sequences(tokenizer)
 
 
-def run_training():
+def run_training(optimized=True):
     """4フェーズの学習を実行"""
-    print("\n=== Starting 4-Phase Training ===")
-    
-    # train.pyのmain関数を呼び出し
-    from train import main as train_main
+    print(f"\n=== Starting 4-Phase Training {'(Optimized)' if optimized else ''} ===")
     
     # main.pyで定義した設定情報を渡す
-    phase_configs = get_phase_configs()
-    train_main(phase_configs)
+    phase_configs = get_phase_configs(optimized=optimized)
+    
+    if optimized:
+        # 最適化版の学習を実行
+        for i in range(1, 5):
+            phase_str = f"phase{i}"
+            if phase_str in phase_configs:
+                config = phase_configs[phase_str]
+                train_phase_optimized(i, config)
+    else:
+        # 通常版の学習を実行
+        from train import main as train_main
+        train_main(phase_configs)
 
 
 def generate_text(checkpoint_path: str, prompt: str, max_length: int = 100):
@@ -166,9 +175,9 @@ def generate_text(checkpoint_path: str, prompt: str, max_length: int = 100):
     return generated_text
 
 
-def get_phase_configs():
+def get_phase_configs(optimized=True):
     """全フェーズの学習設定を取得"""
-    configs = {
+    base_configs = {
         "phase1": {
             "description": "Knowledge Explanation Learning",
             "train_data_path": "data/phase1/training_sequences.pt",
@@ -213,12 +222,26 @@ def get_phase_configs():
             "previous_checkpoint": "checkpoints/phase3/checkpoint_best",
             "learning_rate": 2e-5,
             "num_epochs": 10,
-            "batch_size": 2,
-            "gradient_accumulation_steps": 16,
+            "batch_size": 8,
+            "gradient_accumulation_steps": 4,
             "warmup_steps": 200
         }
     }
-    return configs
+    
+    # 最適化オプションを追加
+    if optimized:
+        optimization_options = {
+            "use_gradient_checkpointing": True,
+            "use_fused_optimizer": True,
+            "compile_model": False,  # PyTorch 2.0+でTrueに設定可能
+            "use_dynamic_batching": False,
+            "fp16": True
+        }
+        
+        for phase in base_configs:
+            base_configs[phase].update(optimization_options)
+    
+    return base_configs
 
 
 def main():
@@ -244,6 +267,8 @@ def main():
     train_parser = subparsers.add_parser('train', help='Run 4-phase training')
     train_parser.add_argument('--phase', type=int, choices=[1, 2, 3, 4],
                             help='Train specific phase only')
+    train_parser.add_argument('--no-optimize', action='store_true',
+                            help='Disable training optimizations')
     
     # 生成コマンド
     generate_parser = subparsers.add_parser('generate', help='Generate text with trained model')
@@ -287,17 +312,22 @@ def main():
             generate_phase4_data()
     
     elif args.command == 'train':
+        use_optimized = not args.no_optimize
+        
         if args.phase:
             # 指定フェーズのみ学習
-            phase_configs = get_phase_configs()
+            phase_configs = get_phase_configs(optimized=use_optimized)
             if f"phase{args.phase}" in phase_configs:
                 config = phase_configs[f"phase{args.phase}"]
-                train_phase(args.phase, config)
+                if use_optimized:
+                    train_phase_optimized(args.phase, config)
+                else:
+                    train_phase(args.phase, config)
             else:
                 print(f"Error: Configuration for phase {args.phase} not found.")
         else:
             # 全フェーズ学習
-            run_training()
+            run_training(optimized=use_optimized)
     
     elif args.command == 'generate':
         generate_text(args.checkpoint, args.prompt, args.max_length)
@@ -316,7 +346,7 @@ def main():
         generate_phase4_data()
         
         # 3. 学習
-        run_training()
+        run_training(optimized=True)
         
         print("\nPipeline completed successfully!")
         print("Trained model checkpoints are available in 'checkpoints/' directory")

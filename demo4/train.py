@@ -8,6 +8,8 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import numpy as np
+import psutil
+import gc
 from model import get_gpt2_model
 from tokenizer import JapaneseTokenizer
 from transformers import get_linear_schedule_with_warmup
@@ -16,14 +18,22 @@ from transformers import get_linear_schedule_with_warmup
 class GPT2Dataset(Dataset):
     """GPT-2学習用データセット"""
     
-    def __init__(self, data_path: str, max_length: int = 1024):
+    def __init__(self, data_path: str, max_length: int = 1024, use_memory_map: bool = True):
         self.data_path = data_path
         self.max_length = max_length
+        self.use_memory_map = use_memory_map
         
         # データを読み込む
         if data_path.endswith('.pt'):
             # 事前にトークナイズされたテンソル
-            self.data = torch.load(data_path)
+            if use_memory_map and os.path.exists(data_path):
+                # メモリマップを使用してディスクから直接読む
+                self.data = torch.load(data_path, map_location='cpu')
+                if hasattr(self.data, 'pin_memory'):
+                    # ピンメモリに配置して転送を高速化
+                    self.data = self.data.pin_memory()
+            else:
+                self.data = torch.load(data_path)
         else:
             # JSONLファイルから読み込み
             self.data = []
@@ -39,6 +49,9 @@ class GPT2Dataset(Dataset):
         if isinstance(self.data, torch.Tensor):
             # 既にトークナイズ済み
             tokens = self.data[idx]
+            # メモリ効率化のため必要な長さにトリミング
+            if len(tokens) > self.max_length:
+                tokens = tokens[:self.max_length]
             return {
                 "input_ids": tokens,
                 "labels": tokens
@@ -72,6 +85,9 @@ class Trainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.fp16 = fp16
         self.max_grad_norm = max_grad_norm
+        
+        # メモリ使用量追跡
+        self.memory_stats = []
         
         # オプティマイザの設定
         self.optimizer = optim.AdamW(
@@ -114,8 +130,8 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             labels = batch['labels'].to(self.device)
 
-            # 勾配をリセット
-            self.optimizer.zero_grad()
+            # 勾配をリセット（効率的なメモリ解放）
+            self.optimizer.zero_grad(set_to_none=True)
             
             # 順伝播
             if self.scaler:
@@ -159,8 +175,12 @@ class Trainer:
                     
                     self.optimizer.step()
                 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
+                
+                # メモリ使用量を記録
+                if self.global_step % 100 == 0:
+                    self._log_memory_usage()
                 
                 # ロスを記録
                 total_loss += step_loss
@@ -219,7 +239,9 @@ class Trainer:
             batch_size=batch_size,
             shuffle=True,
             num_workers=4,
-            pin_memory=True
+            pin_memory=True,
+            persistent_workers=True,  # ワーカーを維持してオーバーヘッドを削減
+            prefetch_factor=2  # プリフェッチで高速化
         )
         
         eval_loader = None
@@ -314,6 +336,33 @@ class Trainer:
             self.epoch = state["epoch"]
         
         print(f"Checkpoint loaded: {checkpoint_path}")
+    
+    def _log_memory_usage(self):
+        """メモリ使用量をログに記録"""
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            self.memory_stats.append({
+                'step': self.global_step,
+                'allocated_gb': allocated,
+                'reserved_gb': reserved
+            })
+            
+            # 定期的にガベージコレクション
+            if self.global_step % 1000 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
+    
+    def get_memory_summary(self):
+        """メモリ使用量のサマリーを取得"""
+        if torch.cuda.is_available():
+            return {
+                'current_allocated_gb': torch.cuda.memory_allocated() / 1024**3,
+                'current_reserved_gb': torch.cuda.memory_reserved() / 1024**3,
+                'max_allocated_gb': torch.cuda.max_memory_allocated() / 1024**3,
+                'max_reserved_gb': torch.cuda.max_memory_reserved() / 1024**3
+            }
+        return None
 
 
 def train_phase(phase, config):
@@ -334,10 +383,12 @@ def train_phase(phase, config):
         print("Warning: Tokenizer not found. Please train tokenizer first.")
         return
     
-    # モデルの作成または読み込み
+    # モデルの作成または読み込み（勾配チェックポイントを有効化）
+    use_gradient_checkpointing = config.get("use_gradient_checkpointing", True)
     model = get_gpt2_model(
         model_size=config.get("model_size", "medium"),
-        vocab_size=len(tokenizer)
+        vocab_size=len(tokenizer),
+        use_gradient_checkpointing=use_gradient_checkpointing
     )
     
     # 前のフェーズのチェックポイントを読み込む
