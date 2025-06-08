@@ -169,7 +169,7 @@ def generate_text(checkpoint_path: str, prompt: str, max_length: int = 100):
     # デコード
     generated_text = tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=True)
     
-    print(f"\nPrompt: {prompt}")
+    print(f"\nPrompt   : {prompt}")
     print(f"Generated: {generated_text}")
     
     return generated_text
